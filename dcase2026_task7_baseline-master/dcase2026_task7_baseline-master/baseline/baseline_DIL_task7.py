@@ -123,6 +123,16 @@ class Learner():
         self.known_classes = 0
         self.cur_task = -1
         self.class_increments = []
+        self.replay_memory_df = pd.DataFrame()
+
+    def _sample_replay_examples(self, df, samples_per_class, random_state=1193):
+        """Build a balanced replay subset from a dataframe."""
+        if df is None or len(df) == 0 or samples_per_class <= 0:
+            return pd.DataFrame(columns=df.columns if df is not None else None)
+        sampled = df.groupby('new_target', group_keys=False).apply(
+            lambda x: x.sample(n=min(samples_per_class, len(x)), random_state=random_state)
+        )
+        return sampled.reset_index(drop=True)
 
     def incremental_train(self, train_loader, val_loader, device, args):
 
@@ -211,6 +221,14 @@ class Learner():
 
         print("Starting DIL Task D{}".format(self.cur_task + 1))
 
+        # Replay memory to mitigate forgetting on previously-seen domains.
+        if self.cur_task > 1 and len(self.replay_memory_df) > 0 and args.replay_per_class > 0:
+            replay_df = self._sample_replay_examples(
+                self.replay_memory_df, args.replay_per_class, random_state=1193 + self.cur_task
+            )
+            print(f'Using replay samples: {len(replay_df)}')
+            train_df = pd.concat([train_df, replay_df], axis=0).sample(frac=1.0, random_state=1193).reset_index(drop=True)
+
         dataset_train = DILDataset(train_df, config.audio_folder_DIL)
         dataset_val = DILDataset(valid_df, config.audio_folder_DIL)
         #dataset_test = DILDataset(test_df, config.audio_folder_DIL)
@@ -228,6 +246,13 @@ class Learner():
             self.load_checkpoint(device)
         else:
             self.incremental_train(train_loader, validate_loader, device, args)
+
+        # Update replay memory with current domain data after training.
+        if args.memory_per_class > 0:
+            current_memory = self._sample_replay_examples(
+                train_df[train_df['domain'].isin(seen_domains[-1])], args.memory_per_class, random_state=2291 + self.cur_task
+            )
+            self.replay_memory_df = pd.concat([self.replay_memory_df, current_memory], axis=0).reset_index(drop=True)
 
         #self.acc_prev(seen_domains, config.df_DIL_dev, config.df_DIL_eval, batch_size, num_workers, device)
 
@@ -251,9 +276,10 @@ class Learner():
             print('seen domain: {} and its accuracy: {}'.format(seen_domains[domain], accuracy))
 
             accuracy_previous.append(accuracy)
+            domain_dict[seen_domains[domain][0]] = accuracy
 
         average_accuracy = np.mean(accuracy_previous).item()
-        return average_accuracy
+        return average_accuracy, domain_dict
 
 def train(args):
     # Arugments & parameters
@@ -295,8 +321,15 @@ def train(args):
 
 
         model.incremental_setup(train_df, test_df, seen_domains, batch_size, num_workers, device, args)
-        seen_accuracy = model.acc_prev(seen_domains, df_dev_train, df_dev_test, batch_size, num_workers, device)
+        seen_accuracy, seen_domain_acc = model.acc_prev(seen_domains, df_dev_train, df_dev_test, batch_size, num_workers, device)
         print('Average Accuracy: ', seen_accuracy)
+
+        # Key checkpoints requested most often in DIL analysis.
+        if task == 0:
+            print(f'[After D2] D2 accuracy: {seen_domain_acc.get("D2", "N/A")}')
+        elif task == 1:
+            print(f'[After D3] D2 accuracy: {seen_domain_acc.get("D2", "N/A")}')
+            print(f'[After D3] D3 accuracy: {seen_domain_acc.get("D3", "N/A")}')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Example of parser. ')
@@ -315,6 +348,8 @@ if __name__ == '__main__':
     parser_train.add_argument('--epoch', type=int, required=True)
     parser_train.add_argument('--resume', action='store_true', default=False)
     parser_train.add_argument('--save', action='store_true', default=False)
+    parser_train.add_argument('--replay_per_class', type=int, default=20)
+    parser_train.add_argument('--memory_per_class', type=int, default=40)
     # Parse arguments
     args = parser.parse_args()
     args.filename = get_filename(__file__)
