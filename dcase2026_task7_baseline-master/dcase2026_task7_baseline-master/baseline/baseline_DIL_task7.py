@@ -253,7 +253,7 @@ class Learner():
             accuracy_previous.append(accuracy)
 
         average_accuracy = np.mean(accuracy_previous).item()
-        return average_accuracy
+        return average_accuracy, accuracy_previous
 
 def train(args):
     # Arugments & parameters
@@ -295,7 +295,10 @@ def train(args):
 
 
         model.incremental_setup(train_df, test_df, seen_domains, batch_size, num_workers, device, args)
-        seen_accuracy = model.acc_prev(seen_domains, df_dev_train, df_dev_test, batch_size, num_workers, device)
+        seen_accuracy, acc_list = model.acc_prev(
+            seen_domains, df_dev_train, df_dev_test, batch_size, num_workers, device
+        )
+        print('Per-domain accuracy: ', acc_list)
         print('Average Accuracy: ', seen_accuracy)
 
 if __name__ == '__main__':
