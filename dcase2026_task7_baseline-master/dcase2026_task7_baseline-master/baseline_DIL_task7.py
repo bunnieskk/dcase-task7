@@ -111,26 +111,52 @@ def _compute_uncertainity(model, loader, seen_domains, device):
         inputs = inputs.float()
         inputs = inputs.to(device)
 
-        # Stage-1: D1 vs non-D1 by BN_D1 matching + entropy
-        with torch.no_grad():
-            outputs_d1 = model(inputs, task=0)
-            outputs_d1 = torch.softmax(outputs_d1, dim=1)
-            epsilon = sys.float_info.min
-            entropy_d1 = -torch.sum(outputs_d1 * torch.log(outputs_d1 + epsilon), dim=-1)
-            bn_score_d1 = model.compute_bn_match_score(inputs, task=0)
+        has_bn_match = hasattr(model, 'compute_bn_match_score')
+        has_domain_head = hasattr(model, 'forward_domain')
+        epsilon = sys.float_info.min
 
-        is_d1 = (bn_score_d1 <= d1_bn_threshold) & (entropy_d1 <= d1_entropy_threshold)
-
-        # Stage-2: D2 vs D3 domain branch for non-D1 samples
-        if torch.all(is_d1):
-            task_id = torch.zeros(inputs.shape[0], dtype=torch.long, device=device)
-        elif len(seen_domains) == 1:
-            task_id = torch.ones(inputs.shape[0], dtype=torch.long, device=device)
-        else:
+        if has_bn_match:
+            # Stage-1: D1 vs non-D1 by BN_D1 matching + entropy
             with torch.no_grad():
-                domain_logits = model.forward_domain(inputs, feature_task=0)
-                domain_pred = torch.argmax(domain_logits, dim=-1)  # 0->D2, 1->D3
-            task_id = torch.where(is_d1, torch.zeros_like(domain_pred), domain_pred + 1)
+                outputs_d1 = model(inputs, task=0)
+                outputs_d1 = torch.softmax(outputs_d1, dim=1)
+                entropy_d1 = -torch.sum(outputs_d1 * torch.log(outputs_d1 + epsilon), dim=-1)
+                bn_score_d1 = model.compute_bn_match_score(inputs, task=0)
+
+            is_d1 = (bn_score_d1 <= d1_bn_threshold) & (entropy_d1 <= d1_entropy_threshold)
+
+            # Stage-2: D2 vs D3 domain branch for non-D1 samples
+            if torch.all(is_d1):
+                task_id = torch.zeros(inputs.shape[0], dtype=torch.long, device=device)
+            elif len(seen_domains) == 1:
+                task_id = torch.ones(inputs.shape[0], dtype=torch.long, device=device)
+            elif has_domain_head:
+                with torch.no_grad():
+                    domain_logits = model.forward_domain(inputs, feature_task=0)
+                    domain_pred = torch.argmax(domain_logits, dim=-1)  # 0->D2, 1->D3
+                task_id = torch.where(is_d1, torch.zeros_like(domain_pred), domain_pred + 1)
+            else:
+                # Fallback for external/legacy net implementations without forward_domain.
+                with torch.no_grad():
+                    outputs_d2 = torch.softmax(model(inputs, task=1), dim=1)
+                    outputs_d3 = torch.softmax(model(inputs, task=2), dim=1)
+                    entropy_d2 = -torch.sum(outputs_d2 * torch.log(outputs_d2 + epsilon), dim=-1)
+                    entropy_d3 = -torch.sum(outputs_d3 * torch.log(outputs_d3 + epsilon), dim=-1)
+                    non_d1_task = torch.where(entropy_d2 <= entropy_d3,
+                                              torch.ones_like(entropy_d2, dtype=torch.long),
+                                              torch.full_like(entropy_d2, 2, dtype=torch.long))
+                task_id = torch.where(is_d1, torch.zeros_like(non_d1_task), non_d1_task)
+        else:
+            # Full fallback for legacy external models: task with minimum predictive entropy.
+            nb_tasks = len(seen_domains) + 1  # +1 for D1 branch
+            entropy_candidates = []
+            with torch.no_grad():
+                for task in range(nb_tasks):
+                    outputs_t = torch.softmax(model(inputs, task=task), dim=1)
+                    entropy_t = -torch.sum(outputs_t * torch.log(outputs_t + epsilon), dim=-1)
+                    entropy_candidates.append(entropy_t.unsqueeze(1))
+            entropy_all = torch.cat(entropy_candidates, dim=1)  # [B, nb_tasks]
+            task_id = torch.argmin(entropy_all, dim=1)
 
         # Final class prediction with selected domain-specific BN branch
         outputs_list = []
@@ -345,6 +371,9 @@ class Learner():
 
     def train_binary_domain_classifier(self, domain_df, batch_size, num_workers, device, args):
         if domain_df.empty:
+            return
+        if (not hasattr(self.model, 'domain_fc')) or (not hasattr(self.model, 'forward_domain')):
+            print('[Warn] Skip D2/D3 domain head training: external MCnn14 has no domain_fc/forward_domain.')
             return
 
         self.model.to(device)
