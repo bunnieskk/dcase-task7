@@ -108,6 +108,7 @@ class MCnn14(nn.Module):
         self.conv_block6 = ConvBlock(in_channels=1024, out_channels=2048, nb_tasks=nb_tasks)
 
         self.fc = nn.Linear(2048, classes_num)
+        self.domain_fc = nn.Linear(2048, 2)
 
 
 
@@ -174,9 +175,12 @@ class MCnn14(nn.Module):
 
 
     def forward(self, input, task=1):
-        """
-        Input: (batch_size, data_length)"""
+        x = self.extract_feature(input, task)
+        x = self.fc(x)
+        return x
 
+    def extract_feature(self, input, task=1):
+        """Extract backbone feature before the class head."""
         x = self.spectrogram_extractor(input)  # (batch_size, 1, time_steps, freq_bins)
         x = self.logmel_extractor(x)
         x = x.transpose(1, 3)
@@ -198,7 +202,26 @@ class MCnn14(nn.Module):
         (x1, _) = torch.max(x, dim=2)
         x2 = torch.mean(x, dim=2)
         x = x1 + x2
-        x = self.fc(x)
         return x
 
+    def forward_domain(self, input, feature_task=0):
+        """Binary domain classifier head for D2-vs-D3."""
+        feature = self.extract_feature(input, feature_task)
+        return self.domain_fc(feature)
+
+    def compute_bn_match_score(self, input, task=0):
+        """Compute per-sample BN matching score against running stats."""
+        x = self.spectrogram_extractor(input)
+        x = self.logmel_extractor(x)
+        x = x.transpose(1, 3)
+
+        sample_mean = torch.mean(x, dim=[2, 3])
+        sample_var = torch.var(x, dim=[2, 3], unbiased=False)
+
+        running_mean = self.bn0[task].running_mean.unsqueeze(0)
+        running_var = self.bn0[task].running_var.unsqueeze(0)
+
+        mean_diff = torch.mean((sample_mean - running_mean) ** 2, dim=1)
+        var_diff = torch.mean((sample_var - running_var) ** 2, dim=1)
+        return mean_diff + var_diff
 

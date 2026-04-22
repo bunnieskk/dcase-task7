@@ -23,6 +23,7 @@ from sklearn import metrics
 from tqdm import tqdm
 from utilities import *
 import time
+from torch.utils.data import Dataset
 
 timestr = time.strftime("%Y%m%d-%H%M%S")
 
@@ -60,33 +61,47 @@ def _compute_accuracy(model, loader, task, device):
 
 def _compute_uncertainity(model, loader, seen_domains, device):
     model.eval()
-    nb_tasks = len(seen_domains) + 1 # +1 is D1
     correct, total = 0, 0
     output_dict = {}
     output_path = config.output_folder
     if not os.path.exists(output_path):
         os.makedirs(output_path)
+
+    d1_bn_threshold = 0.05
+    d1_entropy_threshold = 1.8
+
     for i, (inputs, targets, audio_file) in enumerate(loader):
-        outputs_uncs = None
         inputs = inputs.float()
         inputs = inputs.to(device)
-        for task in range(nb_tasks):
-            with torch.no_grad():
-                outputs = model(inputs, task)
-            outputs = torch.softmax(outputs, dim=1)
-            if outputs_uncs is None:
-                outputs_uncs = outputs.detach()
-            else:
-                outputs_uncs = torch.concat([outputs_uncs, outputs.detach()], dim=0)
 
-        epsilon = sys.float_info.min
-        entropy = -torch.sum(outputs_uncs * torch.log(outputs_uncs + epsilon), dim=-1)
-        # Predicted Task Id
-        _, task_id = torch.min(entropy, dim=-1, keepdim=False)
-
-        # Classification
+        # Stage-1: D1 vs non-D1 by BN_D1 matching + entropy
         with torch.no_grad():
-            outputs = model(inputs, task_id)
+            outputs_d1 = model(inputs, task=0)
+            outputs_d1 = torch.softmax(outputs_d1, dim=1)
+            epsilon = sys.float_info.min
+            entropy_d1 = -torch.sum(outputs_d1 * torch.log(outputs_d1 + epsilon), dim=-1)
+            bn_score_d1 = model.compute_bn_match_score(inputs, task=0)
+
+        is_d1 = (bn_score_d1 <= d1_bn_threshold) & (entropy_d1 <= d1_entropy_threshold)
+
+        # Stage-2: D2 vs D3 domain branch for non-D1 samples
+        if torch.all(is_d1):
+            task_id = torch.zeros(inputs.shape[0], dtype=torch.long, device=device)
+        elif len(seen_domains) == 1:
+            task_id = torch.ones(inputs.shape[0], dtype=torch.long, device=device)
+        else:
+            with torch.no_grad():
+                domain_logits = model.forward_domain(inputs, feature_task=0)
+                domain_pred = torch.argmax(domain_logits, dim=-1)  # 0->D2, 1->D3
+            task_id = torch.where(is_d1, torch.zeros_like(domain_pred), domain_pred + 1)
+
+        # Final class prediction with selected domain-specific BN branch
+        outputs_list = []
+        with torch.no_grad():
+            for sample_idx in range(inputs.shape[0]):
+                outputs_sample = model(inputs[sample_idx:sample_idx + 1], int(task_id[sample_idx].item()))
+                outputs_list.append(outputs_sample)
+        outputs = torch.cat(outputs_list, dim=0)
         outputs = torch.softmax(outputs, dim=1)
         predicts = torch.max(outputs, dim=1)[1]
         target_labels = targets
@@ -109,6 +124,22 @@ def _compute_uncertainity(model, loader, seen_domains, device):
     #print('confusion matrix:', cm)
     #print('class-wise accuracy', class_acc)
     return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+
+
+class BinaryDomainDataset(Dataset):
+    """Binary dataset for D2-vs-D3 discriminator training."""
+
+    def __init__(self, df, audio_folder):
+        self.audio_ds = DILDataset(df, audio_folder)
+        domain_map = {'D2': 0, 'D3': 1}
+        self.domain_labels = [domain_map[df.iloc[idx]['domain']] for idx in range(len(df))]
+
+    def __len__(self):
+        return len(self.audio_ds)
+
+    def __getitem__(self, idx):
+        audio, _, audio_file = self.audio_ds[idx]
+        return audio, self.domain_labels[idx], audio_file
 
 
 class Learner():
@@ -256,6 +287,52 @@ class Learner():
         average_accuracy = np.mean(accuracy_previous).item()
         # return average_accuracy
         return average_accuracy, accuracy_previous
+
+    def train_binary_domain_classifier(self, domain_df, batch_size, num_workers, device, args):
+        if domain_df.empty:
+            return
+
+        self.model.to(device)
+        self.model.freeze_weight()
+        for param in self.model.domain_fc.parameters():
+            param.requires_grad = True
+
+        domain_dataset = BinaryDomainDataset(domain_df, config.audio_folder_DIL)
+        domain_loader = torch.utils.data.DataLoader(
+            dataset=domain_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(
+            self.model.domain_fc.parameters(),
+            lr=args.domain_learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-08,
+            weight_decay=0.,
+            amsgrad=True,
+        )
+
+        self.model.train()
+        for epoch_idx in range(1, args.domain_epoch + 1):
+            epoch_loss = 0.0
+            for audio, domain_target, _ in domain_loader:
+                audio = audio.float().to(device)
+                domain_target = domain_target.long().to(device)
+                optimizer.zero_grad()
+                domain_logits = self.model.forward_domain(audio, feature_task=0)
+                loss = criterion(domain_logits, domain_target)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            print(
+                f"[Domain D2/D3] epoch {epoch_idx}/{args.domain_epoch}, "
+                f"loss: {epoch_loss / max(1, len(domain_loader)):.4f}"
+            )
 '''
 def train(args):
     # Arugments & parameters
@@ -397,6 +474,10 @@ def train(args):
             history_accuracies[dom_name].append(acc_list[i]) # 追加当下的准确率
 
         print(f'Average Accuracy after {current_train_domain}: {seen_accuracy:.2f}')
+
+    # Train the second-stage domain discriminator: D2 vs D3
+    domain_df = df_dev_train[df_dev_train['domain'].isin(['D2', 'D3'])]
+    model.train_binary_domain_classifier(domain_df, batch_size, num_workers, device, args)
     
     # ---------------------------------------------------------
     # 【核心修改 3】在最后打印出一份按时间轴排布的详细轨迹报告
@@ -443,6 +524,8 @@ if __name__ == '__main__':
     parser_train.add_argument('--epoch', type=int, required=True)
     parser_train.add_argument('--resume', action='store_true', default=False)
     parser_train.add_argument('--save', action='store_true', default=False)
+    parser_train.add_argument('--domain_epoch', type=int, default=5)
+    parser_train.add_argument('--domain_learning_rate', type=float, default=1e-4)
     # Parse arguments
     args = parser.parse_args()
     args.filename = get_filename(__file__)
